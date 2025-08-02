@@ -28,7 +28,9 @@ from tools import (
     create_hierarchical_alias_map,
     rerank_by_recency
     )
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+HF_REPO_ID = "tovarich86/analise-ilp-dados"
 
 # --- Módulos do Projeto (devem estar na mesma pasta) ---
 from knowledge_base import DICIONARIO_UNIFICADO_HIERARQUICO
@@ -45,14 +47,16 @@ GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.5-flash"
 CVM_SEARCH_URL = "https://www.rad.cvm.gov.br/ENET/frmConsultaExternaCVM.aspx"
 
+CACHE_DIR = Path("data_cache_gradio") # Usamos um novo diretório de cache para evitar conflitos
+
+# Mapeia o nome do arquivo no repositório para o nome que ele terá localmente
 FILES_TO_DOWNLOAD = {
-    "item_8_4_chunks_map_final.json": "https://github.com/tovarich86/agentev3/releases/download/V2.0-DATA/item_8_4_chunks_map.json",
-    "item_8_4_faiss_index_final.bin": "https://github.com/tovarich86/agentev3/releases/download/V2.0-DATA/item_8_4_faiss_index.bin",
-    "outros_documentos_chunks_map_final.json": "https://github.com/tovarich86/agentev3/releases/download/V2.0-DATA/outros_documentos_chunks_map.json",
-    "outros_documentos_faiss_index_final.bin": "https://github.com/tovarich86/agentev3/releases/download/V2.0-DATA/outros_documentos_faiss_index.bin",
-    "resumo_fatos_e_topicos_final_enriquecido.json": "https://github.com/tovarich86/agentev3/releases/download/V2.0-DATA/resumo_fatos_e_topicos_v4_por_data.json"
+    "item_8_4_chunks_map.json": "item_8_4_chunks_map_final.json",
+    "item_8_4_faiss_index.bin": "item_8_4_faiss_index_final.bin",
+    "outros_documentos_chunks_map.json": "outros_documentos_chunks_map_final.json",
+    "outros_documentos_faiss_index.bin": "outros_documentos_faiss_index_final.bin",
+    "resumo_fatos_e_topicos_v4_por_data.json": "resumo_fatos_e_topicos_final_enriquecido.json"
 }
-CACHE_DIR = Path("data_cache")
 SUMMARY_FILENAME = "resumo_fatos_e_topicos_final_enriquecido.json"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -62,91 +66,89 @@ logger = logging.getLogger(__name__)
 # --- CARREGADOR DE DADOS ---
 @st.cache_resource(show_spinner="Configurando o ambiente e baixando dados...")
 def setup_and_load_data():
+    """
+    Baixa dados do Hugging Face Hub, carrega modelos e prepara todos os artefatos
+    necessários para a aplicação. É executada uma única vez no início.
+    """
+    logger.info("Iniciando configuração e carregamento de dados...")
     CACHE_DIR.mkdir(exist_ok=True)
-    
-    for filename, url in FILES_TO_DOWNLOAD.items():
-        local_path = CACHE_DIR / filename
+
+    # 1. Baixar todos os arquivos de dados do Hugging Face Hub
+    for repo_filename, local_filename in FILES_TO_DOWNLOAD.items():
+        local_path = CACHE_DIR / local_filename
         if not local_path.exists():
-            logger.info(f"Baixando arquivo '{filename}'...")
+            logger.info(f"Baixando '{repo_filename}' do repo '{HF_REPO_ID}'...")
             try:
-                response = requests.get(url, stream=True, timeout=60)
-                response.raise_for_status()
-                with open(local_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                logger.info(f"'{filename}' baixado com sucesso.")
-            except requests.exceptions.RequestException as e:
-                st.error(f"Erro ao baixar {filename} de {url}: {e}")
-                st.stop()
-    # --- Carregamento de Modelos ---
-    st.write("Carregando modelo de embedding...")
-    embedding_model = SentenceTransformer(MODEL_NAME)
-    
-    st.write("Carregando modelo de Re-ranking (Cross-Encoder)...")
-    cross_encoder_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    
+                # A função hf_hub_download baixa o arquivo e o coloca em um cache gerenciado.
+                downloaded_path_str = hf_hub_download(
+                    repo_id=HF_REPO_ID,
+                    filename=repo_filename,
+                    cache_dir=CACHE_DIR, # Define um diretório de cache local
+                    force_filename=local_filename # Força o nome do arquivo final
+                )
+                logger.info(f"Arquivo salvo em: {downloaded_path_str}")
+            except Exception as e:
+                logger.error(f"Falha ao baixar '{repo_filename}': {e}")
+                # Em um app real, você poderia querer sair do programa aqui
+                raise e
+
+    # 2. Carregar os modelos de ML
+    logger.info("Carregando modelos de embedding e cross-encoder...")
+    embedding_model = get_embedding_model()
+    cross_encoder_model = get_cross_encoder_model()
+
+    # 3. Carregar os artefatos (índices FAISS e mapas de chunks)
     artifacts = {}
-    for index_file in CACHE_DIR.glob('*_faiss_index_final.bin'):
-        category = index_file.stem.replace('_faiss_index_final', '')
-        chunks_file = CACHE_DIR / f"{category}_chunks_map_final.json"
+    for index_file_path in CACHE_DIR.glob('*_faiss_index_final.bin'):
+        category = index_file_path.stem.replace('_faiss_index_final', '')
+        chunks_file_path = CACHE_DIR / f"{category}_chunks_map_final.json"
         try:
-            # CORREÇÃO APLICADA: Ler a lista de chunks diretamente da chave 'chunks'
-            with open(chunks_file, 'r', encoding='utf-8') as f:
+            with open(chunks_file_path, 'r', encoding='utf-8') as f:
+                # Acessa diretamente a lista de chunks, como no seu código corrigido
                 list_of_chunks = json.load(f)
-                
+
             artifacts[category] = {
-                'index': faiss.read_index(str(index_file)),
+                'index': faiss.read_index(str(index_file_path)),
                 'chunks': list_of_chunks
             }
+            logger.info(f"Artefatos para a categoria '{category}' carregados com sucesso.")
         except Exception as e:
-            st.error(f"Falha ao carregar artefatos para a categoria '{category}': {e}")
-            st.stop()
+            logger.error(f"Falha ao carregar artefatos para a categoria '{category}': {e}")
+            raise
 
-    summary_file_path = CACHE_DIR / SUMMARY_FILENAME
+    # 4. Carregar os dados de resumo
+    summary_file_path = CACHE_DIR / "resumo_fatos_e_topicos_final_enriquecido.json"
     try:
         with open(summary_file_path, 'r', encoding='utf-8') as f:
             summary_data = json.load(f)
-    except FileNotFoundError:
-        st.error(f"Erro crítico: '{SUMMARY_FILENAME}' não foi encontrado.")
-        st.stop()
+        logger.info("Dados de resumo carregados com sucesso.")
+    except FileNotFoundError as e:
+        logger.error(f"Erro crítico ao carregar dados de resumo: {e}")
+        raise
 
+    # 5. Gerar listas de filtros dinâmicos
     setores = set()
     controles = set()
-
     for artifact_data in artifacts.values():
-        # CORREÇÃO APLICADA: Acessar a lista de chunks diretamente
-        chunk_map = artifact_data.get('chunks', [])
-        for metadata in chunk_map:
-            # Pega o valor do setor e trata se for nulo ou vazio
+        for metadata in artifact_data.get('chunks', []):
             setor = metadata.get('setor')
             if isinstance(setor, str) and setor.strip():
                 setores.add(setor.strip().capitalize())
-            else:
-                setores.add("Não idenficado")
 
-            # Pega o valor do controle e trata se for nulo ou vazio
             controle = metadata.get('controle_acionario')
             if isinstance(controle, str) and controle.strip():
                 controles.add(controle.strip().capitalize())
-            else:
-                controles.add("Não identificado")
 
-    # Converte os sets em listas ordenadas e adiciona "Todos" no início
-    sorted_setores = sorted([s for s in setores if s != "Não Informado"])
-    if "Não Informado" in setores:
-        sorted_setores.append("Não Informado")
+    all_setores = ["Todos"] + sorted(list(setores))
+    all_controles = ["Todos"] + sorted(list(controles))
+    logger.info("Listas de filtros dinâmicos geradas.")
 
-    sorted_controles = sorted([c for c in controles if c != "Não Informado"])
-    if "Não Informado" in controles:
-        sorted_controles.append("Não Informado")
-
-    all_setores = ["Todos"] + sorted_setores
-    all_controles = ["Todos"] + sorted_controles
-
-    logger.info(f"Filtros dinâmicos encontrados: {len(all_setores)-1} setores e {len(all_controles)-1} tipos de controle.")
-    
-    return artifacts, summary_data, all_setores, all_controles, embedding_model, cross_encoder_model
-
+    logger.info("✅ Ambiente pronto!")
+    # Retorna todos os objetos que a aplicação precisará
+    return (
+        artifacts, summary_data, all_setores, all_controles,
+        embedding_model, cross_encoder_model
+    )
 
 
 # --- FUNÇÕES GLOBAIS E DE RAG ---
