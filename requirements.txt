@@ -1,7 +1,16 @@
+
 gradio
+
 pandas
 numpy
+
+
 faiss-cpu
 sentence-transformers
-huggingface_hub
 requests
+
+huggingface_hub
+
+torch
+torchvision
+torchaudio
