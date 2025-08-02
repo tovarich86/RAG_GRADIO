@@ -1,21 +1,16 @@
 # models.py
-import streamlit as st
+# Remova a importação do streamlit se não for mais usada em nenhum outro lugar no arquivo.
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import logging
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2'
-CROSS_ENCODER_MODEL_NAME = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
-
-@st.cache_resource(show_spinner="Carregando modelo de embedding...")
 def get_embedding_model():
-    logger.info(f"Carregando modelo de embedding: {MODEL_NAME}")
-    model = SentenceTransformer(MODEL_NAME)
+    logger.info("Carregando modelo de embedding: 'paraphrase-multilingual-mpnet-base-v2'")
+    model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-mpnet-base-v2')
     return model
 
-@st.cache_resource(show_spinner="Carregando modelo de re-ranking...")
 def get_cross_encoder_model():
-    logger.info(f"Carregando cross-encoder: {CROSS_ENCODER_MODEL_NAME}")
-    model = CrossEncoder(CROSS_ENCODER_MODEL_NAME)
+    logger.info("Carregando cross-encoder: 'cross-encoder/ms-marco-MiniLM-L-6-v2'")
+    model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     return model
