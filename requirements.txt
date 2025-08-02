@@ -1,6 +1,7 @@
-streamlit
+gradio
+pandas
 numpy
 faiss-cpu
 sentence-transformers
+huggingface_hub
 requests
-
