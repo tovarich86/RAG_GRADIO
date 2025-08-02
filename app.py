@@ -150,6 +150,211 @@ def setup_and_load_data():
         embedding_model, cross_encoder_model
     )
 
+# --- Carregamento Global dos Dados e Modelos ---
+# Esta parte já deve existir no seu script
+(
+    artifacts, summary_data, setores_disponiveis, controles_disponiveis,
+    embedding_model, cross_encoder_model
+) = setup_and_load_data()
+
+def run_full_analysis(query, setor, controle, priorizar_recente, progress=gr.Progress(track_tqdm=True)):
+    """
+    Função completa que orquestra a análise, chamada pela interface do Gradio.
+    Usa um gerador (`yield`) para fornecer atualizações de status para a UI.
+    """
+    # Validação inicial
+    if not query.strip():
+        # A função deve retornar um valor para cada output definido no .click()
+        # Retornamos (status_text, markdown_text, dataframe_data)
+        yield "Pronto.", "⚠️ Por favor, digite uma pergunta.", None
+        return
+
+    # 1. Preparar filtros e status inicial
+    active_filters = {}
+    if setor != "Todos": active_filters['setor'] = setor.lower()
+    if controle != "Todos": active_filters['controle_acionario'] = controle.lower()
+    
+    progress(0.1, desc="Analisando intenção da pergunta...")
+
+    # 2. Roteamento de Intenção (Híbrido: Regras + LLM)
+    intent = None
+    query_lower = query.lower()
+    quantitative_keywords = [
+        'liste', 'quais empresas', 'quais companhias', 'quantas', 'média',
+        'mediana', 'estatísticas', 'mais comuns', 'prevalência', 'contagem'
+    ]
+    if any(keyword in query_lower for keyword in quantitative_keywords):
+        intent = "quantitativa"
+    else:
+        # A função get_query_intent_with_llm foi importada de tools.py
+        # e já foi adaptada para receber a api_key
+        intent = get_query_intent_with_llm(query, GEMINI_API_KEY, GEMINI_MODEL)
+
+    # --- ROTA QUANTITATIVA ---
+    if intent == "quantitativa":
+        progress(0.5, desc="Executando análise quantitativa rápida...")
+        report_text, data_result = analytical_engine.answer_query(query, filters=active_filters)
+        
+        df_to_show = None
+        if isinstance(data_result, pd.DataFrame):
+            df_to_show = data_result
+        elif isinstance(data_result, dict) and data_result:
+            # Se a análise retornar múltiplos dataframes, exibimos o primeiro e avisamos no texto.
+            first_key = next(iter(data_result))
+            df_to_show = data_result[first_key]
+            if len(data_result) > 1:
+                report_text += f"\n\n*Nota: Múltiplas tabelas foram geradas. Exibindo a primeira: '{first_key}'.*"
+
+        progress(1.0, desc="Análise quantitativa concluída!")
+        yield "Análise Concluída!", report_text, df_to_show
+        return
+
+    # --- ROTA QUALITATIVA (RAG) ---
+    progress(0.2, desc="Gerando plano de análise RAG...")
+    # Todas as funções necessárias (create_dynamic_analysis_plan, etc.) foram importadas de tools.py
+    plan_response = create_dynamic_analysis_plan(query, company_catalog_rich, DICIONARIO_UNIFICADO_HIERARQUICO, summary_data, active_filters)
+
+    if plan_response['status'] != "success":
+        progress(1.0, desc="Falha na identificação.")
+        suggestion = suggest_alternative_query(query, DICIONARIO_UNIFICADO_HIERARQUICO)
+        error_message = f"Não consegui identificar uma intenção clara na sua pergunta.\n\n**Sugestão:**\n`{suggestion}`"
+        yield "Falha no Plano", error_message, None
+        return
+
+    plan = plan_response['plan']
+
+    # --- Lógica de Comparação (Múltiplas Empresas) ---
+    if len(plan.get('empresas', [])) > 1:
+        progress(0.4, desc=f"Analisando {len(plan['empresas'])} empresas em paralelo...")
+        with ThreadPoolExecutor(max_workers=len(plan['empresas'])) as executor:
+            futures = [
+                executor.submit(
+                    analyze_single_company, empresa, plan, query, artifacts, embedding_model,
+                    cross_encoder_model, DICIONARIO_UNIFICADO_HIERARQUICO, company_catalog_rich,
+                    company_lookup_map, execute_dynamic_plan, get_final_unified_answer, GEMINI_API_KEY, GEMINI_MODEL
+                )
+                for empresa in plan['empresas']
+            ]
+            results = [future.result() for future in futures]
+        
+        progress(0.8, desc="Gerando relatório comparativo final...")
+        structured_context = json.dumps(results, indent=2, ensure_ascii=False)
+        comparison_prompt = f"""Sua tarefa é criar um relatório comparativo detalhado sobre "{query}", usando os dados estruturados no CONTEXTO JSON abaixo. Comece com uma análise textual e, em seguida, apresente uma TABELA MARKDOWN clara que compare os tópicos lado a lado para cada empresa. CONTEXTO: {structured_context}"""
+        final_answer = get_final_unified_answer(comparison_prompt, "", GEMINI_API_KEY, GEMINI_MODEL)
+        
+        progress(1.0, desc="Relatório comparativo gerado!")
+        yield "Análise Concluída!", final_answer, None
+        return
+
+    # --- Lógica de Análise Única ou Geral ---
+    else:
+        progress(0.5, desc="Recuperando e re-ranqueando contexto...")
+        context, sources = execute_dynamic_plan(
+            query, plan, artifacts, embedding_model, cross_encoder_model,
+            DICIONARIO_UNIFICADO_HIERARQUICO, company_catalog_rich, company_lookup_map,
+            search_by_tags, expand_search_terms, priorizar_recente
+        )
+
+        if not context:
+            progress(1.0, desc="Nenhuma informação encontrada.")
+            yield "Análise Concluída!", "❌ Não encontrei informações relevantes nos documentos para a sua consulta.", None
+            return
+
+        progress(0.8, desc="Gerando resposta final com LLM...")
+        final_answer = get_final_unified_answer(query, context, GEMINI_API_KEY, GEMINI_MODEL)
+
+        # Anexar fontes ao final da resposta
+        if sources:
+            sources_md = "\n\n---\n\n### 📚 Documentos Consultados\n"
+            for src in sorted(sources, key=lambda x: x.get('company_name', '')):
+                company_name = src.get('company_name', 'N/A')
+                doc_date = src.get('document_date', 'N/A')
+                doc_type_raw = src.get('doc_type', '')
+                url = src.get('source_url', '#')
+                display_doc_type = 'Plano de Remuneração' if doc_type_raw == 'outros_documentos' else doc_type_raw.replace('_', ' ')
+                display_text = f"**{company_name}** - {display_doc_type} (Data: {doc_date})"
+                sources_md += f"- {display_text} [Link]({url})\n"
+            final_answer += sources_md
+
+        progress(1.0, desc="Análise concluída!")
+        yield "Análise Concluída!", final_answer, None
+        return
+# --- Construção da Interface Visual com Gradio Blocks ---
+logger.info("Construindo a interface do Gradio...")
+
+with gr.Blocks(title="Agente de Análise ILP", theme=gr.themes.Soft(primary_hue="blue", secondary_hue="sky")) as demo:
+    # --- Título Principal ---
+    gr.Markdown(
+        """
+        # 🤖 Agente de Análise de Planos de Incentivo (ILP)
+        **Faça perguntas quantitativas (listas, médias) ou qualitativas (comparações, detalhes) sobre planos de ILP.**
+        """
+    )
+
+    # --- Layout Principal em Linhas e Colunas ---
+    with gr.Row():
+        # --- Coluna da Esquerda (Sidebar do Streamlit) ---
+        with gr.Column(scale=1, min_width=300):
+            gr.Markdown("### ⚙️ Filtros e Controles")
+            
+            # Dropdowns para filtros, preenchidos com os dados carregados
+            filtro_setor = gr.Dropdown(label="Filtrar por Setor", choices=setores_disponiveis, value="Todos")
+            filtro_controle = gr.Dropdown(label="Filtrar por Controle Acionário", choices=controles_disponiveis, value="Todos")
+            
+            # Checkbox para priorizar recência
+            check_priorizar_recente = gr.Checkbox(label="Priorizar documentos mais recentes", value=True, info="Dá um bônus de relevância para os documentos mais novos.")
+
+            # Um componente de texto para mostrar o status da análise
+            status_component = gr.Textbox(label="Status da Análise", value="Pronto.", interactive=False)
+
+            # Acordeão para a lista de empresas (equivalente ao st.expander)
+            with gr.Accordion("Empresas com Dados de Resumo", open=False):
+                lista_empresas_df = pd.DataFrame(sorted(list(summary_data.keys())), columns=["Empresa"])
+                gr.DataFrame(lista_empresas_df, interactive=False, height=400)
+
+        # --- Coluna da Direita (Área Principal) ---
+        with gr.Column(scale=3):
+            # Acordeão para o Guia do Usuário
+            with gr.Accordion("ℹ️ Guia Rápido de Uso", open=False):
+                gr.Markdown(
+                    """
+                    #### 1. Perguntas de Listagem e Estatística (Análise Rápida)
+                    Use palavras como `liste`, `quais empresas`, `média de`, `mais comuns`.
+                    *Ex: "Qual o período médio de vesting (em anos)?"*
+
+                    #### 2. Análise Profunda (RAG)
+                    Faça perguntas abertas sobre uma empresa específica.
+                    *Ex: "Como funciona o plano de vesting da Vale?"*
+
+                    #### 3. Comparação (RAG)
+                    Mencione duas ou mais empresas na sua pergunta.
+                    *Ex: "Compare o tratamento de dividendos da Localiza e da Movida."*
+                    """
+                )
+            
+            # Componente de Input para a pergunta do usuário
+            query_input = gr.Textbox(
+                label="Faça sua pergunta:",
+                lines=5,
+                placeholder="Ex: Compare as cláusulas de Malus/Clawback da Vale com as do Itaú."
+            )
+
+            # Botão de Ação Principal
+            analisar_btn = gr.Button("🔍 Analisar", variant="primary")
+
+            gr.Markdown("---")
+            gr.Markdown("### 📋 Resultado da Análise")
+            
+            # Componentes de Saída que serão atualizados pela lógica do backend
+            output_markdown = gr.Markdown(label="Relatório Analítico")
+            output_dataframe = gr.DataFrame(label="Dados Tabulares", interactive=False)
+
+# --- Lançamento da Aplicação ---
+# O if __name__ == "__main__": garante que o servidor só iniciará quando o script for executado diretamente
+if __name__ == "__main__":
+    # O método launch() inicia o servidor web do Gradio
+    demo.launch(debug=True) # debug=True ajuda a ver erros no console
+
 
 # --- FUNÇÕES GLOBAIS E DE RAG ---
 
